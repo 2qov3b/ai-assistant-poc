@@ -1,5 +1,19 @@
 from openai import OpenAI
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
+
+def call_llm_docs(
+        docs:List[Any],
+        query:str,
+        url:str,
+        api_key:str,
+        model_name:str,
+)->str:
+    #Deepseek client
+    llm = ChatDeepSeek(model=model_name, api_key = api_key, base_url = url)
+    chain = load_qa_chain(llm=llm, chain_type="stuff")
+    #Submit the matched documents and user questions to DeepSeek for polishing
+    response = chain.run(input_documents = docs, question = query)
+    return response
 
 def call_llm(
         url:str,
