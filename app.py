@@ -1,6 +1,7 @@
 import streamlit as st
-from llm_api import call_llm, call_llm_docs
+from llm_api import call_llm, call_llm_docs, classify_intent,handle_order_query
 from vector_store import process_document_deepseek
+from function import check_order_status
 
 # Custom CSS styles
 st.markdown("""
@@ -68,6 +69,10 @@ def init_session_state():
             'vector_store':None
         }    
 
+    #Define orders
+    if 'orders' not in st.session_state:
+        st.session_state.orders = []    
+
 def show_sidebar():
     """Show left sidebar"""
     with st.sidebar:
@@ -89,6 +94,10 @@ def show_sidebar():
         #Knowledge base configuration
         if st.button("ナレッジベース設定"):
             st.session_state.current_page = 'knowledge_cofig'    
+
+        #Loading order information
+        if st.button("注文設定"):
+            st.session_state.current_page = "order_config"
 
 def show_main_content():
     """Show main window"""
@@ -153,69 +162,109 @@ def show_chat():
 def process_message(message: str):
     """Processing new messages"""
     if message.strip():
-        #Add User Message
-        st.session_state.messages.append({
-            "role":"user",
-            "content": message
-        })
-
-        #Create matching knowledge bases and knowledge base sources
-        #Matching knowledge block content
-        context  =""
-        #Matching knowledge block number
-        sources =[]
-
-        if st.session_state.knowledge_base['vector_store']:
-            #Create an index for the vector database for the purpose of searching or matching
-            retriver = st.session_state.knowledge_base['vector_store'].as_retriever()
-            #Input user request is matched against vector database
-            docs = retriver.invoke(message)
-            context = "\n".join( [doc.page_content for doc in docs])
-            sources = [f"ナレッジブロック #{i+1} " for i, doc  in enumerate(docs)]
-
-            #If the content of the knowledge base is matched
-            if docs:
-                st.session_state.messages.append({
-                    "role":"assistant",
-                    "content":"ナレッジベースから以下の関連情報を取得します",
-                    "sources":sources,
-                    "is_knowledge":True,
-                    "docs": [{"page_content": doc.page_content, "metadata": doc.metadata} for doc in docs]
-                })
-            else:
-                st.session_state.messages.append({
-                    "role":"assistant",
-                    "content":"以下の関連情報はナレッジベースから取得されませんでした",
-                    "is_knowledge":False
-                })
-
-        #Call the large model to reply to the message
-        if docs:
-            #call_llm_docs
-            bot_response = call_llm_docs(
-                docs=docs,
-                query=message,
-                url= st.session_state.llm_config['url'],
-                api_key=st.session_state.llm_config['api_key'],
-                model_name=st.session_state.llm_config['model']
-            )
-        else:
-            #System prompt words
-            system_prompt =f"{st.session_state.bot_config['description']}"
-            #Call the LLM to respond
-            bot_response = call_llm(
-                url= st.session_state.llm_config['url'],
-                api_key=st.session_state.llm_config['api_key'],
-                model_name=st.session_state.llm_config['model'],
-                prompt=message,
-                system_prompt=system_prompt
-            )
+        intent = classify_intent(
+            url=st.session_state.llm_config['url'],
+            api_key=st.session_state.llm_config['api_key'],
+            model_name=st.session_state.llm_config['model'],
+            message= message,
+            role=st.session_state.bot_config['description']
+        )
 
         st.session_state.messages.append({
             "role":"assistant",
-            "content":bot_response,
-            "sources": sources if sources else None
+            "content":message,
+            "sources": intent
         })
+
+        # Routing to different processing flows based on intent type
+        if intent['intent_type'] == 'order':
+            response = handle_order_query(
+                url=st.session_state.llm_config['url'],
+                api_key=st.session_state.llm_config['api_key'],
+                model_name=st.session_state.llm_config['model'],
+                message=message,
+                role=st.session_state.bot_config['description']
+            )
+        elif intent['intent_type'] == 'knowledge':
+            response = handle_knowledge_query(message)
+        else:  # Others, it will be handled by human
+            response = handle_human_transfer(intent)
+
+        
+        # Add assistant reply
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": response,
+            "intent": intent  # Save intent information for debugging
+        })
+
+def handle_knowledge_query(message: str) -> str:
+    """Handling knowledge base related issues"""
+    context = ""
+    sources = []
+    
+    # Check if the knowledge base is loaded
+    if st.session_state.knowledge_base['vector_store'] is None:
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "⚠️ ナレッジベースはまだ読み込まれていません。まずはナレッジベース設定ページでドキュメントをアップロードしてください。",
+            "is_knowledge": False
+        })
+        return "ナレッジベースはまだ読み込まれていません。まずはナレッジベース設定ページでドキュメントをアップロードしてください。"
+            
+    retriever = st.session_state.knowledge_base['vector_store'].as_retriever()
+    docs = retriever.invoke(message)
+    context = "\n".join([doc.page_content for doc in docs])
+    sources = [f"ナレッジブロック #{i+1} " 
+                for i, doc in enumerate(docs)]
+    
+    # Display knowledge base search results
+    if docs:
+        st.session_state.messages.append({
+            "role": "assistant", 
+            "content": "🔍 ナレッジベースから以下の情報を見つけてください:",
+            "sources": sources,
+            "is_knowledge": True,
+            "docs": [{"page_content": doc.page_content, "metadata": doc.metadata} for doc in docs]
+        })
+    else:
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "ℹ️ ナレッジベースで関連する一致が見つかりません",
+            "is_knowledge": False
+        })
+
+    if docs:  # If the knowledge base is hit
+        bot_response = call_llm_docs(
+            docs, 
+            message,
+            url=st.session_state.llm_config['url'],
+            api_key=st.session_state.llm_config['api_key'],
+            model_name=st.session_state.llm_config['model']
+        )
+    else:  # If the knowledge base is not hit
+        system_prompt = f"{st.session_state.bot_config['description']}"
+        if context:
+            system_prompt += f"\n\n現在のナレッジベースのコンテキスト:\n{context}"
+        bot_response = call_llm(
+            url=st.session_state.llm_config['url'],
+            api_key=st.session_state.llm_config['api_key'],
+            model_name=st.session_state.llm_config['model'],
+            prompt=message,
+            system_prompt=system_prompt
+        )
+    return bot_response
+
+def handle_human_transfer(intent: dict) -> str:
+    """Route to human customer service"""
+    try:
+        confidence = intent.get('confidence', 0.0)
+        if confidence > 0.6:
+            return "ご質問には手動でのサポートが必要です。カスタマーサービス担当者に転送いたします..."
+        return "お客様の問題は手動での処理が必要です。カスタマーサービスチケットを送信いたしましたので、1時間以内にご連絡いたします。"
+    except Exception as e:
+        print(f"手動エラー処理: {str(e)}")
+        return "カスタマーサービス転送サービスは一時的にご利用いただけません。しばらくしてからもう一度お試しください。"
 
 def show_model_config():
     """Display LLM configuration interface"""
@@ -298,6 +347,54 @@ def save_bot_config():
         'name': st.session_state.bot_name,
         'description':st.session_state.bot_description
     }
+
+def show_order_config():
+    """Display the order configuration interface"""
+    st.title("注文管理")
+    
+    # Add an order form
+    with st.form("add_order_form"):
+        st.subheader("新しい注文を追加")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            username = st.text_input("ユーザー名", key="order_username")
+            product = st.text_input("製品名", key="order_product")
+        with col2:
+            order_id = st.text_input("注文番号", key="order_id")
+            status = st.selectbox(
+                "注文状況",
+                ["支払い待ち", "支払い済み", "発送済み", "完了", "キャンセル"],
+                key="order_status"
+            )
+            date = st.date_input("日付", key="order_date")
+        
+        if st.form_submit_button("注文を追加する"):
+            if not all([username, product, order_id]):
+                st.error("必須項目をすべて入力してください")
+            else:
+                # Check if the order number already exists
+                if any(order["order_id"] == order_id for order in st.session_state.orders):
+                    st.error("注文番号は既に存在します")
+                else:
+                    # Add New Order
+                    st.session_state.orders.append({
+                        "username": username,
+                        "product": product,
+                        "order_id": order_id,
+                        "status": status,
+                        "date": str(date)
+                    })
+                    st.success("注文が正常に追加されました")
+    
+    # Display order list
+    st.subheader("注文リスト")
+    if st.session_state.orders:
+        # Convert to DataFrame for better display
+        orders_df = st.session_state.orders
+        st.dataframe(orders_df)
+    else:
+        st.info("注文データはまだありません")
 
 def show_knowledge_config():
     """Display the knowledge base configuration interface"""
